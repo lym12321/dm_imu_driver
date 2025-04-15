@@ -24,6 +24,8 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+link_libraries(udev)
+
 include_directories(include/dm_imu)
 
 add_executable(imu_node src/imu_node.cc)

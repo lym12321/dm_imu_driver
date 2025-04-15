@@ -1,10 +1,12 @@
 #include <iostream>
 #include <cstdio>
 #include <tuple>
+#include <thread>
+
+#include <libudev.h>
 
 #include <rclcpp/rclcpp.hpp>
 #include <serial_driver/serial_driver.hpp>
-
 #include <sensor_msgs/msg/imu.hpp>
 
 #include "imu_node.h"
@@ -90,134 +92,179 @@ public:
             io_context_ = std::make_shared <IoContext> (1);
             serial_driver_ = std::make_shared <SerialDriver> (*io_context_);
 
+            // init udev monitor thread
+            udev_ = udev_new();
+            if(!udev_) {
+                throw("failed to create udev context");
+            }
+
+            monitor_ = udev_monitor_new_from_netlink(udev_, "udev");
+            udev_monitor_filter_add_match_subsystem_devtype(monitor_, "tty", nullptr);
+            udev_monitor_enable_receiving(monitor_);
+
             conn(path);
 
             // init publisher
             publisher_ = this->create_publisher <sensor_msgs::msg::Imu> ("imu", 10);
             
             // init timer
-            timer_ = this->create_wall_timer(std::chrono::milliseconds(1), std::bind(&imu_node::timer_callback, this));
+            timer_ = this->create_wall_timer(std::chrono::milliseconds(2), std::bind(&imu_node::timer_callback, this));
+            monitor_timer_ = this->create_wall_timer(std::chrono::milliseconds(100), std::bind(
+                &imu_node::monitor_loop, this
+            ));
 
             RCLCPP_INFO(this->get_logger(), "imu_node inited");
         } catch (const std::exception &e) {
             RCLCPP_ERROR(this->get_logger(), "%s", e.what());
             return;
+        } catch (const char *e) {
+            RCLCPP_ERROR(this->get_logger(), "%s", e);
+            return;
         }
-    };
+    }
     ~imu_node() {
-        this->serial_driver_->port()->close();   
+        if(this->serial_driver_ and this->serial_driver_->port() and this->serial_driver_->port()->is_open())
+            this->serial_driver_->port()->close();   
+        udev_monitor_unref(monitor_);
+        udev_unref(udev_);
         RCLCPP_INFO(this->get_logger(), "imu_node closed"); 
     }
 private:
+    bool conn(std::string path, bool debug = false);
+    void rx_solve(const uint8_t *buf);
+    void rx_callback(const std::vector<uint8_t> &data, const size_t &size);
+    void timer_callback();
+
+    void monitor_loop() {
+        if(!monitor_) return;
+        udev_device *dev = udev_monitor_receive_device(monitor_);
+        if(!dev) return;
+
+        const char* action = udev_device_get_action(dev);
+        const char* devnode = udev_device_get_devnode(dev);
+        // const char* vid = udev_device_get_property_value(dev, "ID_VENDOR_ID");
+        // const char* pid = udev_device_get_property_value(dev, "ID_MODEL_ID");
+
+        // RCLCPP_INFO(this->get_logger(), "action: %s, devnode: %s, vid: %s, pid: %s", action, devnode, vid, pid);
+
+        if(serial_port_opened_ and strcmp(action, "remove") == 0 and strcmp(devnode, this->serial_driver_->port()->device_name().c_str()) == 0) {
+            RCLCPP_INFO(this->get_logger(), "serial port disconnected: %s", devnode);
+            serial_driver_->port()->close();
+            serial_port_opened_ = false;
+        }
+        if(!serial_port_opened_ and strcmp(action, "add") == 0) {
+            RCLCPP_INFO(this->get_logger(), "serial port connected: %s", devnode);
+            conn(path_);
+        }
+
+        udev_device_unref(dev);
+    }
+
+    std::atomic <bool> serial_port_opened_;
+
+    udev *udev_;
+    udev_monitor *monitor_;
+    
+    std::shared_ptr <rclcpp::TimerBase> monitor_timer_;
+
     std::shared_ptr <SerialDriver> serial_driver_;
     std::shared_ptr <IoContext> io_context_;
     std::shared_ptr <rclcpp::TimerBase> timer_;
     std::string path_;
 
     rclcpp::Publisher <sensor_msgs::msg::Imu> ::SharedPtr publisher_;
-
-    bool conn(std::string path, bool debug = false) {
-        SerialPortConfig cfg(
-            2000000,
-            FlowControl::NONE,
-            Parity::NONE,
-            StopBits::ONE 
-        );
-
-        auto fp = popen(("ls " + path).c_str(), "r");
-        if(fp) {
-            std::array <char, 25> buf;
-            fscanf(fp, "%s", buf.begin());
-            if(buf[0] == '/') {
-                path.assign(buf.begin(), buf.end());
-            }
-            pclose(fp);
-        }
-
-        RCLCPP_INFO(this->get_logger(), "%s", path.c_str());
-
-        serial_driver_->init_port(path, cfg);
-        
-        auto port = serial_driver_->port();
-
-        try {
-            port->open();
-        } catch(const std::exception &e) {
-            if(debug)
-                RCLCPP_ERROR(this->get_logger(), "error opening serial port: %s", e.what());
-        }
-
-        if(port->is_open()) {
-            port->async_receive([this](const std::vector<uint8_t> &data, const size_t &size) {
-                this->rx_callback(data, size);
-            });
-        } else {
-            return false;
-        }
-        return true;
-    }
-
-    // 19 bytes
-    void rx_solve(const uint8_t *buf) {
-        static_assert(sizeof(imu_data_.pkg.accel) == 19);
-        static_assert(sizeof(imu_data_.pkg.gyro) == 19);
-        static_assert(sizeof(imu_data_.pkg.euler) == 19);
-        switch(buf[3]) {
-            case 0x01:
-                std::copy_n(buf, 19, reinterpret_cast<uint8_t*>(&imu_data_.pkg.accel));
-                break;
-            case 0x02:
-                std::copy_n(buf, 19, reinterpret_cast<uint8_t*>(&imu_data_.pkg.gyro));
-                break;
-            case 0x03:
-                std::copy_n(buf, 19, reinterpret_cast<uint8_t*>(&imu_data_.pkg.euler));
-                break;
-            default:
-                RCLCPP_ERROR(this->get_logger(), "Unknown id: %x", buf[3]);
-                return;
-        }
-    }
-
-    void rx_callback(const std::vector<uint8_t> &data, const size_t &size) {
-        for(size_t i = 0; i < size; i++) {
-            if(data[i] == 0x55 && data[i+1] == 0xAA && data[i+18] == 0x0A) {
-                if(Get_CRC16(data.data() + i, 16) == *reinterpret_cast <const uint16_t*> (data.data() + i + 16)) {
-                    rx_solve(data.data() + i);
-                } else {
-                    RCLCPP_ERROR(this->get_logger(), "CRC ERROR");
-                }
-            }
-        }
-    }
-
-    void timer_callback() {
-        if(!serial_driver_->port()->is_open()) {
-            RCLCPP_ERROR(this->get_logger(), "attempt to re-connect");
-            conn(path_);
-            return;
-        }
-        try {
-            serial_driver_->port()->send_break();
-        } catch(const std::system_error &e) {
-            RCLCPP_ERROR(this->get_logger(), "attempt to re-connect");
-            conn(path_);
-        }
-
-        sensor_msgs::msg::Imu tmp;
-        tmp.header.stamp = this->get_clock()->now();
-        tmp.header.set__frame_id("map");
-        tmp.angular_velocity.x = imu_data_.pkg.gyro.x;
-        tmp.angular_velocity.y = imu_data_.pkg.gyro.y;
-        tmp.angular_velocity.z = imu_data_.pkg.gyro.z;
-        tmp.linear_acceleration.x = imu_data_.pkg.accel.x;
-        tmp.linear_acceleration.y = imu_data_.pkg.accel.y;
-        tmp.linear_acceleration.z = imu_data_.pkg.accel.z;
-        std::tie(tmp.orientation.w, tmp.orientation.x, tmp.orientation.y, tmp.orientation.z) = ToQuaternion (
-            imu_data_.pkg.euler.y / 180 * M_PI, imu_data_.pkg.euler.p / 180 * M_PI, imu_data_.pkg.euler.r / 180 * M_PI
-        );
-        publisher_->publish(tmp);
-    }
 };
+
+bool imu_node::conn(std::string path, bool debug) {
+    SerialPortConfig cfg(
+        2000000,
+        FlowControl::NONE,
+        Parity::NONE,
+        StopBits::ONE 
+    );
+
+    auto fp = popen(("ls " + path).c_str(), "r");
+    if(fp) {
+        std::array <char, 25> buf;
+        fscanf(fp, "%s", buf.begin());
+        if(buf[0] == '/') {
+            path.assign(buf.begin(), buf.end());
+        }
+        pclose(fp);
+    }
+
+    RCLCPP_INFO(this->get_logger(), "%s", path.c_str());
+
+    serial_driver_->init_port(path, cfg);
+    
+    auto port = serial_driver_->port();
+
+    try {
+        port->open();
+    } catch(const std::exception &e) {
+        if(debug)
+            RCLCPP_ERROR(this->get_logger(), "error opening serial port: %s", e.what());
+    }
+
+    if(port->is_open()) {
+        port->async_receive([this](const std::vector<uint8_t> &data, const size_t &size) {
+            this->rx_callback(data, size);
+        });
+        serial_port_opened_ = true;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// 19 bytes
+void imu_node::rx_solve(const uint8_t *buf) {
+    static_assert(sizeof(imu_data_.pkg.accel) == 19);
+    static_assert(sizeof(imu_data_.pkg.gyro) == 19);
+    static_assert(sizeof(imu_data_.pkg.euler) == 19);
+    switch(buf[3]) {
+        case 0x01:
+            std::copy_n(buf, 19, reinterpret_cast<uint8_t*>(&imu_data_.pkg.accel));
+            break;
+        case 0x02:
+            std::copy_n(buf, 19, reinterpret_cast<uint8_t*>(&imu_data_.pkg.gyro));
+            break;
+        case 0x03:
+            std::copy_n(buf, 19, reinterpret_cast<uint8_t*>(&imu_data_.pkg.euler));
+            break;
+        default:
+            RCLCPP_ERROR(this->get_logger(), "Unknown id: %x", buf[3]);
+            return;
+    }
+}
+
+void imu_node::rx_callback(const std::vector<uint8_t> &data, const size_t &size) {
+    for(size_t i = 0; i < size; i++) {
+        if(data[i] == 0x55 && data[i+1] == 0xAA && data[i+18] == 0x0A) {
+            if(Get_CRC16(data.data() + i, 16) == *reinterpret_cast <const uint16_t*> (data.data() + i + 16)) {
+                rx_solve(data.data() + i);
+            } else {
+                RCLCPP_ERROR(this->get_logger(), "CRC ERROR");
+            }
+        }
+    }
+}
+
+void imu_node::timer_callback() {
+    sensor_msgs::msg::Imu tmp;
+    tmp.header.stamp = this->get_clock()->now();
+    tmp.header.set__frame_id("map");
+    tmp.angular_velocity.x = imu_data_.pkg.gyro.x;
+    tmp.angular_velocity.y = imu_data_.pkg.gyro.y;
+    tmp.angular_velocity.z = imu_data_.pkg.gyro.z;
+    tmp.linear_acceleration.x = imu_data_.pkg.accel.x;
+    tmp.linear_acceleration.y = imu_data_.pkg.accel.y;
+    tmp.linear_acceleration.z = imu_data_.pkg.accel.z;
+    std::tie(tmp.orientation.w, tmp.orientation.x, tmp.orientation.y, tmp.orientation.z) = ToQuaternion (
+        imu_data_.pkg.euler.y / 180 * M_PI, imu_data_.pkg.euler.p / 180 * M_PI, imu_data_.pkg.euler.r / 180 * M_PI
+    );
+    publisher_->publish(tmp);
+}
 
 int main(int argc, char **argv) {
     rclcpp::init(argc, argv);
